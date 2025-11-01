@@ -14,7 +14,7 @@ defmodule ExFastQueue.Queue.Job do
   def new(attrs, metadata) do
     %__MODULE__{
       attrs: attrs,
-      id: Ecto.UUID.generate(),
+      id: :erlang.unique_integer([:positive, :monotonic]),
       metadata: Map.merge(%__MODULE__{}.metadata, metadata)
     }
   end

@@ -2,20 +2,9 @@ defmodule ExFastQueue.Queue do
   use GenServer
 
   alias ExFastQueue.Queue.Job
+  alias ExFastQueue.Queue.State
 
   require Logger
-
-  defmodule State do
-    @moduledoc false
-    defstruct pending: [],
-              name: nil,
-              in_progress: %{},
-              max_concurrency: 0,
-              current_workers: 0,
-              task_supervisor: nil,
-              ets_table: nil,
-              fun_to_apply: nil
-  end
 
   def enqueue(queue_id, attrs), do: GenServer.cast(queue_id, {:enqueue, attrs})
 
@@ -24,92 +13,121 @@ defmodule ExFastQueue.Queue do
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
+  @impl true
   def init(opts) do
-    name = Keyword.fetch!(opts, :name)
-
-    table =
-      opts
-      |> Keyword.fetch!(:ets_table)
-      |> :ets.new([:ordered_set, :public, :named_table, read_concurrency: true])
-
-    state = %State{
-      name: name,
-      max_concurrency: 10,
-      task_supervisor: Keyword.fetch!(opts, :task_supervisor),
-      ets_table: table,
-      fun_to_apply: Keyword.fetch!(opts, :fun)
-    }
-
+    state = State.new(opts)
     {:ok, state}
   end
 
-  def handle_cast({:enqueue, attrs}, %State{ets_table: table} = state) do
-    job = Job.new(attrs, %{enqueued_at: System.system_time(:millisecond)})
-    Logger.info("[#{state.name}]: #{job.id}")
-    true = :ets.insert(table, {job.id, job})
-    {:noreply, process_queue(state)}
-  end
-
-  def process_queue(
-        %State{
-          current_workers: current_workers,
-          max_concurrency: max_concurrency,
-          ets_table: table
-        } = state
-      ) do
-    if current_workers >= max_concurrency do
-      state
+  @impl true
+  def handle_cast({:enqueue, attrs}, state) do
+    if length(state.pending) >= state.buffer_size do
+      Logger.warning("#{__MODULE__} Queue is full. Discarding job. #{inspect(attrs)}")
+      {:noreply, state}
     else
-      case next_job(table) do
-        nil ->
-          state
+      job =
+        Job.new(attrs, %{
+          enqueued_at: System.system_time(:millisecond),
+          attempt: 0
+        })
 
-        job ->
-          task =
-            Task.Supervisor.async_nolink(state.task_supervisor, fn ->
-              state.fun_to_apply.(job.attrs)
-            end)
+      Logger.info(log_message(state, "Enqueuing job #{job.id}"))
 
-          new_state = %{
-            state
-            | in_progress: Map.put(state.in_progress, task.ref, job),
-              current_workers: state.current_workers + 1
-          }
+      new_pending = state.pending ++ [job]
+      new_state = %{state | pending: new_pending}
 
-          process_queue(new_state)
-      end
+      {:noreply, process_queue(new_state)}
     end
   end
 
-  defp next_job(table) do
-    case :ets.first(table) do
-      :"$end_of_table" ->
-        nil
+  def process_queue(%State{current_workers: workers, max_concurrency: max} = state)
+      when workers >= max,
+      do: state
 
-      key ->
-        [{id, job}] = :ets.lookup(table, key)
-        :ets.delete(table, id)
-        job
-    end
+  def process_queue(%State{pending: []} = state), do: state
+
+  def process_queue(%State{} = state) do
+    [job | remaining] = state.pending
+
+    task =
+      Task.Supervisor.async_nolink(state.task_supervisor, fn ->
+        state.fun.(job)
+      end)
+
+    new_state = %{
+      state
+      | pending: remaining,
+        in_progress: Map.put(state.in_progress, task.ref, Job.set_started_at(job)),
+        current_workers: state.current_workers + 1
+    }
+
+    process_queue(new_state)
   end
 
+  @impl true
   def handle_info({ref, _result}, %State{} = state) when is_reference(ref) do
-    {job, in_prog} = Map.pop(state.in_progress, ref)
-    new_state = %{state | in_progress: in_prog, current_workers: state.current_workers - 1}
-    Logger.info("[#{state.name}]: #{job.id}")
-    {:noreply, process_queue(new_state)}
-  end
-
-  def handle_info({:DOWN, ref, :process, _pid, reason}, %State{} = state) do
     case Map.pop(state.in_progress, ref) do
       {nil, _state} ->
         {:noreply, state}
 
-      {job, in_prog} ->
-        :ets.insert(state.ets_table, {job.id, job})
-        Logger.error("[#{state.name}] Job #{job.id} failed: #{inspect(reason)}")
-        new_state = %{state | in_progress: in_prog, current_workers: state.current_workers - 1}
+      {%Job{} = job, new_in_progress} ->
+        duration = System.system_time(:millisecond) - job.metadata.started_at
+
+        Logger.info(
+          log_message(state, """
+          Job #{job.id} finished processing
+          Duration: #{duration}ms
+          """)
+        )
+
+        new_state = %{
+          state
+          | in_progress: new_in_progress,
+            current_workers: state.current_workers - 1
+        }
+
         {:noreply, process_queue(new_state)}
     end
+  end
+
+  @impl true
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
+    case Map.pop(state.in_progress, ref) do
+      {nil, _in_prog} ->
+        {:noreply, state}
+
+      {job, new_in_progress} ->
+        Logger.error(log_message(state, "Job #{job.id} failed"))
+
+        new_state = %{
+          state
+          | in_progress: new_in_progress,
+            current_workers: state.current_workers - 1
+        }
+
+        new_state = handle_failure(job, new_state)
+        {:noreply, process_queue(new_state)}
+    end
+  end
+
+  defp handle_failure(job, state) do
+    if job.metadata.attempt < job.metadata.max_retries do
+      job = Job.set_started_at(job) |> Job.increaset_attempt()
+      new_pending = state.pending ++ [job]
+
+      Logger.warning(log_message(state, "Requeuing failed job #{job.id}"))
+
+      %{state | pending: new_pending}
+    else
+      duration = System.system_time(:millisecond) - job.metadata.started_at
+
+      Logger.error(log_message(state, "Discarding job after max retries. Duration #{duration}"))
+
+      state
+    end
+  end
+
+  defp log_message(state, msg) do
+    "[#{__MODULE__}] [#{state.name}] #{msg}"
   end
 end

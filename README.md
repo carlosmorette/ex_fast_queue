@@ -2,15 +2,6 @@
 
 A high-performance, concurrent job queue system for Elixir applications. ExFastQueue provides a simple yet powerful way to process background jobs with configurable concurrency and persistence.
 
-## Features
-
-- **Lightweight and Fast**: Built on top of ETS and GenServer for optimal performance
-- **Concurrent Processing**: Process multiple jobs in parallel with configurable concurrency
-- **Supervision**: Built-in supervision tree for fault tolerance
-- **Simple API**: Easy-to-use interface for enqueuing and processing jobs
-- **Monitoring**: Built-in logging and monitoring capabilities
-- **Snapshots**: Optional job snapshots using ETS tables
-
 ## Installation
 
 Add `ex_fast_queue` to your list of dependencies in `mix.exs`:
